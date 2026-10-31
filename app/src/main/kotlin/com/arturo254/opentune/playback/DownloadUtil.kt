@@ -230,6 +230,7 @@ constructor(
                         when (download.state) {
                             Download.STATE_COMPLETED -> {
                                 downloadRetryCount.remove(download.request.id)
+exportToPublicDownloads(download.request.id)
                                 syncOfflineAssets(download.request.id)
                             }
                             Download.STATE_DOWNLOADING -> {
@@ -422,6 +423,93 @@ constructor(
             false,
         )
         syncOfflineAssets(songId)
+    }
+        private val exportingIds = ConcurrentHashMap.newKeySet<String>()
+
+  
+    private fun exportToPublicDownloads(songId: String) {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.Q) return
+        if (!exportingIds.add(songId)) return
+
+        CoroutineScope(Dispatchers.IO).launch {
+            var createdUri: android.net.Uri? = null
+            try {
+                val song = database.song(songId).firstOrNull()
+                val title = song?.song?.title ?: songId
+                val artist = song?.artists?.joinToString(", ") { it.name }.orEmpty()
+                val baseName = (if (artist.isNotBlank()) "$artist - $title" else title)
+                    .replace(Regex("[\\\\/:*?\"<>|\\p{Cntrl}]"), "_")
+                    .trim()
+                    .take(120)
+
+                
+                val dataSource = CacheDataSource.Factory().setCache(downloadCache).createDataSource()
+                val dataSpec = androidx.media3.datasource.DataSpec.Builder()
+                    .setUri(songId.toUri())
+                    .setKey(songId)
+                    .build()
+
+                java.io.PushbackInputStream(
+                    androidx.media3.datasource.DataSourceInputStream(dataSource, dataSpec),
+                    16,
+                ).use { stream ->
+                   
+                    val header = ByteArray(12)
+                    var n = 0
+                    while (n < header.size) {
+                        val r = stream.read(header, n, header.size - n)
+                        if (r < 0) break
+                        n += r
+                    }
+                    if (n <= 0) return@use
+                    stream.unread(header, 0, n)
+
+                    val isWebm = n >= 4 &&
+                        header[0] == 0x1A.toByte() && header[1] == 0x45.toByte() &&
+                        header[2] == 0xDF.toByte() && header[3] == 0xA3.toByte()
+                    val extension = if (isWebm) "webm" else "m4a"
+                    val mime = if (isWebm) "audio/webm" else "audio/mp4"
+                    val displayName = "$baseName.$extension"
+
+                    val resolver = context.contentResolver
+                    val collection = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
+
+                    
+                    val alreadyExists = resolver.query(
+                        collection,
+                        arrayOf(android.provider.MediaStore.Downloads._ID),
+                        "${android.provider.MediaStore.Downloads.DISPLAY_NAME}=? AND " +
+                            "${android.provider.MediaStore.Downloads.RELATIVE_PATH} LIKE ?",
+                        arrayOf(displayName, "Download/OpenTune%"),
+                        null,
+                    )?.use { it.moveToFirst() } ?: false
+                    if (alreadyExists) return@use
+
+                    val values = android.content.ContentValues().apply {
+                        put(android.provider.MediaStore.Downloads.DISPLAY_NAME, displayName)
+                        put(android.provider.MediaStore.Downloads.MIME_TYPE, mime)
+                        put(android.provider.MediaStore.Downloads.RELATIVE_PATH, "Download/OpenTune")
+                        put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
+                    }
+                    val uri = resolver.insert(collection, values) ?: return@use
+                    createdUri = uri
+
+                    resolver.openOutputStream(uri)?.use { out -> stream.copyTo(out) }
+
+                    val done = android.content.ContentValues().apply {
+                        put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
+                    }
+                    resolver.update(uri, done, null, null)
+                    createdUri = null // success, nothing to clean up
+                }
+            } catch (e: Exception) {
+                // Remove half-written file if something went wrong
+                createdUri?.let { runCatching { context.contentResolver.delete(it, null, null) } }
+                reportException(e)
+            } finally {
+                exportingIds.remove(songId)
+            }
+        }
     }
 
     private fun deviceSupportsMimeType(mimeType: String): Boolean {
